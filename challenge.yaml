@@ -1,0 +1,192 @@
+- hosts: local
+  gather_facts: False
+  tasks:
+
+    # crea una chiave per ssh
+    - name: Create a new EC2 key pair
+      ec2_key:
+        name: "reikbox_key"
+        region: "us-east-1"
+      register: ec2_key
+    - name: Save private key
+      copy: content="{{ ec2_key.key.private_key }}" dest="./keys/reikbox_key.pem" mode=0600
+      when: ec2_key.changed
+
+    # Ottiene le informazioni per VPC di default
+    - name: Obtain default VPC information
+      ec2_vpc_net_info:
+        filters:
+          "isDefault": "true"
+      register: default_vpc
+
+    # Ottiene le informazioni per le subnet di VPC default
+    - name: Obtain subnets for default VPC
+      ec2_vpc_subnet_info:
+        filters:
+          vpc-id: "{{ default_vpc['vpcs'][0]['vpc_id'] }}"
+      register: subnet_info
+
+    # usa jinja per selezionare una subnet a caso
+    - set_fact:
+        vpc_id: "{{ default_vpc['vpcs'][0]['vpc_id'] }}"
+        random_subnet: "{{ subnet_info.subnets|map(attribute='id')|list|random }}"
+
+
+    # prende informazioni da ipify.org
+    - name: Get my public IP
+      community.general.ipify_facts:
+
+    # Crea una security group con output security_group
+    - name: Create Security Group
+      ec2_group:
+        name: "reikbox-sg"
+        description: Security Group for reikbox
+        vpc_id: "{{ vpc_id }}"
+        region: "us-east-1"
+        rules:
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: "{{ ipify_public_ip }}/32"
+            rule_desc: "allow port 22 from {{ ipify_public_ip }}"
+      register: security_group
+
+    # Crea la VM EC2 per il 'Worker node' di Docker; incluso +40 GB di storage
+    - name: Create worker EC2 instance
+      amazon.aws.ec2:
+        key_name: "reikbox_key"
+        region: "us-east-1"
+        instance_type: "t2.micro"
+        image: "ami-0c2b8ca1dad447f8a"
+        vpc_subnet_id: "{{ random_subnet }}"
+        group: "reikbox-sg"
+        wait: yes
+        wait_timeout: 500
+        volumes:
+          - device_name: /dev/xvda
+            device_type: gp2
+            volume_size: 40
+            delete_on_termination: true
+        instance_tags:
+          Name: reikbox-worker
+          Env: sandbox
+        count_tag: 
+          Name: reikbox-worker
+          Env: sandbox
+        exact_count: 1
+        assign_public_ip: yes
+      register: ec2
+      # Aggiunge le informazioni al local host group
+    - name: Add the newly created EC2 instance(s) to the local host group
+      local_action: lineinfile 
+                    path="inventory/ec2"
+                    regexp={{ item.public_ip }}
+                    insertafter="[reikbox]" line="{{ item.public_ip }} ansible_user=ec2-user ansible_ssh_private_key_file=keys/reikbox_key.pem ansible_ssh_extra_args='-o StrictHostKeyChecking=no'"
+      with_items: "{{ ec2.instances }}"
+
+    # Crea la VM EC2 per il 'Manager node' di Docker; incluso +40 GB di storage
+    - name: Create manager EC2 instance
+      amazon.aws.ec2:
+        key_name: "reikbox_key"
+        region: "us-east-1"
+        instance_type: "t2.micro"
+        image: "ami-0c2b8ca1dad447f8a"
+        vpc_subnet_id: "{{ random_subnet }}"
+        group: "reikbox-sg"
+        wait: yes
+        wait_timeout: 500
+        volumes:
+          - device_name: /dev/xvda
+            device_type: gp2
+            volume_size: 40
+            delete_on_termination: true
+        instance_tags:
+          Name: reikbox-manager
+          Env: sandbox
+        count_tag: 
+          Name: reikbox-manager
+          Env: sandbox
+        exact_count: 1
+        assign_public_ip: yes
+      register: ec2
+      
+    - name: Add the newly created EC2 instance(s) to the local host group
+      local_action: lineinfile 
+                    path="inventory/ec2"
+                    regexp={{ item.public_ip }}
+                    insertafter="[reikbox]" line="{{ item.public_ip }} ansible_user=ec2-user ansible_ssh_private_key_file=keys/reikbox_key.pem ansible_ssh_extra_args='-o StrictHostKeyChecking=no'"
+      with_items: "{{ ec2.instances }}"
+
+    # Pausa 5 minuti; per permettere ai VM di inizializzare
+    - meta: refresh_inventory
+    - pause:
+        seconds: 300
+
+# Setup di Docker sulle VM EC2
+- hosts: reikbox
+  become: True
+  gather_facts: True
+  tasks:
+    # yum update
+    - name: Update all packages
+      yum:
+        name: '*'
+        state: latest
+        update_only: yes
+    # ricerca di alcuni pacchetti
+    - name: Ensure a list of yum packages are installed
+      yum:
+        name: "{{ packages }}"
+        state: latest
+        update_cache: yes
+      vars:
+        packages:
+        - python-pip
+        - yum-utils
+        - device-mapper-persistent-data
+        - lvm2
+        - amazon-linux-extras
+    # aggiunge il deposito per installare python3.8, ansible2, e docker
+    - name: Add extras repository
+      shell: yum-config-manager --enable extras
+
+    - name: Enable Some packages from amazon-linux-extras packages
+      shell: "amazon-linux-extras enable python3.8 ansible2 docker"
+
+    - name: clean yum metadata cache
+      command: yum clean metadata
+      args:
+        warn: false
+
+    # controllo se i pacchetti ci sono
+    - name: Ensure a list of yum packages are installed
+      yum:
+        name: "{{ packages }}"
+        state: latest
+        update_cache: yes
+      vars:
+        packages:
+        - python3.8
+        - ansible
+        - docker
+
+    # abilitare Docker quando si attiva il sistema
+    - name: Enable Docker CE service at startup
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    # installare pip dentro a python3.8
+    - name: Upgrade pip3
+      shell: "python3.8 -m pip install pip --upgrade"
+
+    - name: Ensure Python pip packages are installed
+      pip:
+        name: "{{ packages }}"
+        executable: /usr/local/bin/pip3.8
+      vars:
+        packages:
+        - boto
+        - boto3
+        - docker-compose
