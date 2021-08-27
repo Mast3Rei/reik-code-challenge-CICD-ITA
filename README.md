@@ -10,7 +10,7 @@ Per fare partire la ansible playbook, c'è bisogno di questi pacchetti in più:
 3. pip
 
 
-Dopo ho fatto <aws configure> nella command line per inserire i credenziali e la regione.
+Dopo ho fatto aws configure nella command line per inserire i credenziali e la regione.
   
 
 
